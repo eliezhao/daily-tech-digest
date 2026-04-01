@@ -53,7 +53,8 @@ def tg_send(text: str):
     url_api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     MAX = 4000
     chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)]
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        sent = False
         for parse_mode in ["Markdown", None]:
             payload = {"chat_id": TG_CHAT_ID, "text": chunk}
             if parse_mode:
@@ -61,9 +62,14 @@ def tg_send(text: str):
             try:
                 r = requests.post(url_api, json=payload, timeout=15)
                 if r.ok:
+                    sent = True
                     break
-            except Exception:
-                pass
+                else:
+                    print(f"  [TG WARN] chunk {i+1} parse_mode={parse_mode}: {r.status_code} {r.text[:200]}")
+            except Exception as e:
+                print(f"  [TG ERROR] chunk {i+1}: {e}")
+        if not sent:
+            print(f"  [TG FAIL] chunk {i+1} 所有方式均失败，内容前50字: {chunk[:50]}")
         time.sleep(0.5)
 
 # ── Kimi 联网搜索（多轮 tool_calls）────────────────────────────────────────

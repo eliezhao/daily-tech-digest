@@ -16,6 +16,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      - name: Check secrets are configured
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          MISSING=""
+          [ -z "$KIMI_API_KEY" ] && MISSING="$MISSING KIMI_API_KEY"
+          [ -z "$TG_TOKEN"     ] && MISSING="$MISSING TG_TOKEN"
+          [ -z "$TG_CHAT_ID"   ] && MISSING="$MISSING TG_CHAT_ID"
+          if [ -n "$MISSING" ]; then
+            echo "❌ 以下 Secrets 未配置：$MISSING"
+            echo "请到 仓库 → Settings → Secrets and variables → Actions 添加"
+            exit 1
+          fi
+          echo "✅ 所有 Secrets 已配置"
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v6
         with:
@@ -24,6 +41,27 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Test Telegram connectivity
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python - << 'PYEOF'
+          import os, sys, requests
+          token   = os.environ["TG_TOKEN"]
+          chat_id = os.environ["TG_CHAT_ID"]
+          r = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat_id, "text": "⚙️ GitHub Actions 连通测试 — 正在运行日报任务..."},
+              timeout=15
+          )
+          if r.ok:
+              print(f"✅ Telegram 连通正常，消息 id={r.json()['result']['message_id']}")
+          else:
+              print(f"❌ Telegram 发送失败: {r.status_code} {r.text}")
+              sys.exit(1)
+          PYEOF
 
       - name: Run daily digest
         env:
