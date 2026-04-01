@@ -186,27 +186,36 @@ def build_events_report(date: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 FUNDING_KIMI_PROMPTS = [
-    # 深圳/广东中文
-    "今天是{date}。请联网搜索过去48小时内深圳、广州、广东省的科技企业融资新闻。"
-    "搜索 36kr、IT桔子、创业邦、虎嗅等来源，关键词：深圳融资、广州AI融资、广东科技投资 等。"
-    "返回原始信息：公司名、融资金额/轮次、业务、投资方、官网/联系方式（如有）、来源链接。",
+    # 华南中文（15天窗口）
+    "今天是{date}，截止日期是{date}，请只返回{cutoff}到{date}之间（即过去15天内）发布的融资新闻，"
+    "超出此时间范围的一律不收录。"
+    "请联网搜索深圳、广州、广东省、华南地区的 AI公司、软件/SaaS公司、云计算公司 的融资新闻。"
+    "搜索来源：36kr、IT桔子、创业邦、虎嗅、36氪、钛媒体。"
+    "每条必须注明新闻发布日期。返回原始信息：公司名、融资金额/轮次、业务描述、投资方、官网、来源链接、发布日期。",
 
-    # 亚洲英文（排除中国大陆，避免重复）
-    "Today is {date}. Search for tech startup funding news in the past 48 hours "
-    "from East/Southeast Asia: Hong Kong, Singapore, Japan, South Korea, Taiwan, Vietnam, Indonesia. "
-    "Focus on AI, SaaS, cloud, deep tech companies. "
-    "Return: company name, amount/round, business (note ☁️ if cloud/AI), investors, "
-    "official website, contact info (if available), source URL.",
+    # 亚洲英文（15天窗口）
+    "Today is {date}. Return ONLY funding news published between {cutoff} and {date} (past 15 days). "
+    "Strictly exclude any news older than {cutoff}. "
+    "Search for AI, software, SaaS, and cloud tech startup funding from "
+    "East/Southeast Asia: Hong Kong, Singapore, Japan, South Korea, Taiwan, Vietnam, Indonesia. "
+    "Each item must include the publication date. "
+    "Return: company name, amount/round, business (mark ☁️ if cloud/AI), investors, "
+    "official website, contact info if available, source URL, publication date.",
 
-    # 全球AI/云（仅大额或知名）
-    "Today is {date}. Search for notable AI and cloud tech startup funding rounds announced in the past 48 hours globally. "
-    "Focus on companies with significant cloud or AI components (not just pure biotech/fintech). "
-    "Return: company, amount/round, geography, business description, investors, website, source.",
+    # 全球AI/云（15天窗口）
+    "Today is {date}. Return ONLY AI and cloud tech startup funding news published between {cutoff} and {date} (past 15 days). "
+    "Strictly exclude anything older than {cutoff}. "
+    "Focus on companies where AI or cloud is the core business (not just a feature). "
+    "Each item must include the publication date. "
+    "Return: company, amount/round, geography, business description, investors, website, source URL, publication date.",
 ]
 
-def kimi_search_funding(date: str) -> str:
+def kimi_search_funding(date: str, cutoff: str) -> str:
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(kimi_ask, p.format(date=date)): p[:30] for p in FUNDING_KIMI_PROMPTS}
+        futures = {
+            pool.submit(kimi_ask, p.format(date=date, cutoff=cutoff)): p[:30]
+            for p in FUNDING_KIMI_PROMPTS
+        }
         results = {}
         for fut in as_completed(futures):
             label = futures[fut]
@@ -217,47 +226,68 @@ def kimi_search_funding(date: str) -> str:
     return "\n\n---\n\n".join(results.values())
 
 def build_funding_report(date: str) -> str:
+    from datetime import timedelta
+    cutoff = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=15)).strftime("%Y-%m-%d")
+
+    print(f"  [Funding] 时间窗口：{cutoff} → {date}（15天）")
     print("  [Funding] 启动爬虫...")
     raw_items = collect_all_funding()
 
-    # 序列化爬虫数据
+    # RSS 条目也按15天过滤
+    from datetime import timezone
+    cutoff_dt = datetime.strptime(cutoff, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    filtered_items = []
+    for it in raw_items:
+        if not it.published:
+            filtered_items.append(it)
+            continue
+        try:
+            import email.utils
+            pub_dt = datetime(*email.utils.parsedate(it.published)[:6], tzinfo=timezone.utc)
+            if pub_dt >= cutoff_dt:
+                filtered_items.append(it)
+        except Exception:
+            filtered_items.append(it)
+
     rss_text = "\n".join(
         f"- [{it.source}] {it.title} | {it.published[:16]} | {it.url}"
-        for it in raw_items
+        for it in filtered_items
     )
 
     print("  [Funding] Kimi 补充搜索（并发3个 prompt）...")
-    kimi_raw = kimi_search_funding(date)
+    kimi_raw = kimi_search_funding(date, cutoff)
 
-    final_prompt = f"""今天是 {date}。
+    final_prompt = f"""今天是 {date}，数据时间窗口为 {cutoff} 至 {date}（过去15天）。
 
-以下是从多个来源收集到的科技融资原始数据，请帮我整理、去重、格式化，输出一份专业的投融资日报。
+以下是从多个来源收集到的科技融资原始数据，请帮我整理、去重、格式化，输出一份专业的投融资周报。
 
-【数据来源一：TechCrunch RSS + 36kr 抓取（英文/中文）】
+【数据来源一：TechCrunch RSS（英文）】
 {rss_text or "（无数据）"}
 
-【数据来源二：Kimi 联网搜索（广深/亚洲/全球AI云）】
+【数据来源二：Kimi 联网搜索（华南/亚洲/全球AI云）】
 {kimi_raw}
 
 ---
 
 整理要求：
-1. 去重（同一公司/融资只保留最完整的一条）
-2. 只保留科技类：AI、软件、SaaS、云服务、硬件科技（剔除纯生物医药、房产等）
-3. 按优先级排序：深圳 → 广东 → 华南 → 亚洲其他 → 全球
-4. 每条格式：
-   💰 公司名（中英文都写）
+1. 严格只保留 {cutoff} 之后发布的融资新闻，超出时间范围的一律剔除
+2. 只保留 AI公司、软件/SaaS公司、云计算公司（剔除纯生物医药、消费品、房产等）
+3. 每条必须标注融资新闻的发布日期
+4. 按优先级排序：深圳 → 广东 → 华南 → 亚洲其他 → 全球
+5. 每条格式：
+   💰 公司名（中英文）
+   📅 新闻日期：
    💵 融资：金额 / 轮次
    📍 地区：
-   🏭 业务：（涉及云/AI加 ☁️ 或 🤖 标注）
-   🌐 官网：（如能找到）
-   📬 联系：（邮箱/微信公众号/LinkedIn，如能找到）
+   🏭 业务：（AI/云加 ☁️ 或 🤖）
+   🌐 官网：
+   📬 联系：（邮箱/微信公众号/LinkedIn，如有）
    🤝 投资方：
    📰 来源：
-5. 无法确认的字段留空，不要编造
-6. 最多展示15条"""
+6. 无法确认的字段留空，不要编造
+7. 最多展示20条，优先展示华南地区"""
 
-    print("  [Funding] Kimi 最终汇总整理...")
+    print(f"  [Funding] RSS过滤后 {len(filtered_items)} 条，Kimi 最终汇总整理...")
     return kimi_ask(final_prompt)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,7 +314,9 @@ def main():
     # ── 融资日报 ─────────────────────────────────────────────────────────────
     print(f"\n[{ts()}] === 任务二：投融资 ===")
     funding_report = build_funding_report(date_str)
-    tg_send(f"💼 *科技投融资日报*\n_{date_str}_ | 华南优先 → 亚洲 → 全球 ☁️🤖\n\n{funding_report}")
+    from datetime import timedelta
+    cutoff_str = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=15)).strftime("%Y-%m-%d")
+    tg_send(f"💼 *科技投融资周报*\n📅 {cutoff_str} → {date_str}（过去15天）\nAI / 软件 / 云计算 | 华南优先 ☁️🤖\n\n{funding_report}")
     print(f"[{ts()}] 投融资日报已发送")
 
     print(f"\n[{ts()}] 全部完成！")
