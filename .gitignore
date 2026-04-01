@@ -1,0 +1,12 @@
+# 密钥文件 — 绝不上传
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 日志
+*.log

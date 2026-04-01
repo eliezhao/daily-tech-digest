@@ -1,0 +1,33 @@
+name: 广深科技日报
+
+on:
+  schedule:
+    # 每天 08:00 上海时间 = 00:00 UTC
+    - cron: '0 0 * * *'
+  # 允许在 GitHub 网页上手动点击运行（用于测试）
+  workflow_dispatch:
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily digest
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python bot.py
