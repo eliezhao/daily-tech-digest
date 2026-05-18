@@ -287,3 +287,181 @@ def collect_all_funding() -> list[FundingItem]:
     all_items = tc_items + kr_items
     print(f"  → 融资原始数据合计 {len(all_items)} 条")
     return all_items
+
+# ════════════════════════════════════════════════════════════════════════════
+# A股科技股行情 + 财联社快讯（akshare 数据源）
+# ════════════════════════════════════════════════════════════════════════════
+
+# 关注的科技概念板块关键字（akshare 概念板块名称匹配）
+TECH_CONCEPT_KEYWORDS = [
+    "人工智能", "AIGC", "大模型", "算力", "AI芯片", "GPU",
+    "半导体", "芯片", "存储芯片", "EDA", "光刻机",
+    "云计算", "云服务", "数据要素", "数据中心",
+    "软件开发", "操作系统", "鸿蒙", "信创",
+    "智能驾驶", "机器人", "人形机器人", "智能座舱",
+    "数字经济", "金融科技", "区块链",
+]
+
+def is_a_stock_open_today() -> bool:
+    """简易判断今日是否 A 股交易日。失败时默认 True（保证数据采集尝试）。"""
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        today = datetime.now().strftime("%Y-%m-%d")
+        return today in df["trade_date"].astype(str).values
+    except Exception as e:
+        print(f"  [Market WARN] 交易日判断失败: {e}（默认按交易日处理）")
+        return True
+
+def fetch_tech_concept_sectors(top_n: int = 10) -> list[dict]:
+    """获取科技相关概念板块涨跌幅，按涨幅排序返回 TOP N。"""
+    try:
+        import akshare as ak
+        df = ak.stock_board_concept_name_em()
+    except Exception as e:
+        print(f"  [Market WARN] 板块数据获取失败: {e}")
+        return []
+
+    name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
+    chg_col = next((c for c in df.columns if "涨跌幅" in c), None)
+    if not chg_col:
+        return []
+
+    mask = df[name_col].astype(str).apply(
+        lambda n: any(k in n for k in TECH_CONCEPT_KEYWORDS)
+    )
+    sub = df[mask].copy()
+    if sub.empty:
+        return []
+    sub[chg_col] = sub[chg_col].astype(float, errors="ignore")
+    sub = sub.sort_values(chg_col, ascending=False).head(top_n)
+
+    out = []
+    for _, row in sub.iterrows():
+        out.append({
+            "name": str(row.get(name_col, "")),
+            "change_pct": float(row.get(chg_col, 0) or 0),
+            "leader": str(row.get("领涨股票", "") or row.get("领涨股", "")),
+            "stocks_up": int(row.get("上涨家数", 0) or 0) if "上涨家数" in df.columns else 0,
+            "stocks_down": int(row.get("下跌家数", 0) or 0) if "下跌家数" in df.columns else 0,
+        })
+    return out
+
+def fetch_concept_top_stocks(concept: str, n: int = 3) -> list[dict]:
+    """获取某概念板块涨幅前 N 个成分股。"""
+    try:
+        import akshare as ak
+        df = ak.stock_board_concept_cons_em(symbol=concept)
+    except Exception as e:
+        print(f"  [Market WARN] 板块 {concept} 成分股获取失败: {e}")
+        return []
+
+    chg_col = next((c for c in df.columns if "涨跌幅" in c), None)
+    name_col = "名称" if "名称" in df.columns else None
+    code_col = "代码" if "代码" in df.columns else None
+    price_col = "最新价" if "最新价" in df.columns else None
+    if not (chg_col and name_col):
+        return []
+
+    sub = df.sort_values(chg_col, ascending=False).head(n)
+    return [
+        {
+            "name": str(r.get(name_col, "")),
+            "code": str(r.get(code_col, "") or ""),
+            "price": float(r.get(price_col, 0) or 0) if price_col else 0.0,
+            "change_pct": float(r.get(chg_col, 0) or 0),
+        }
+        for _, r in sub.iterrows()
+    ]
+
+def fetch_north_bound_flow() -> Optional[dict]:
+    """北向资金当日净流入（单位：亿元）。"""
+    try:
+        import akshare as ak
+        df = ak.stock_hsgt_fund_flow_summary_em()
+        if df is None or df.empty:
+            return None
+        # 取北上汇总行
+        net_col = next((c for c in df.columns if "净" in c and ("买" in c or "流入" in c)), None)
+        type_col = df.columns[0]
+        north = df[df[type_col].astype(str).str.contains("北向|沪股通|深股通", na=False)]
+        if north.empty or not net_col:
+            return None
+        total = north[net_col].astype(float, errors="ignore").sum()
+        return {"net_inflow_yi": float(total)}
+    except Exception as e:
+        print(f"  [Market WARN] 北向资金获取失败: {e}")
+        return None
+
+def fetch_cls_news(n: int = 20) -> list[dict]:
+    """财联社 24h 重要快讯（仅保留科技/AI/资本相关）。"""
+    try:
+        import akshare as ak
+        try:
+            df = ak.stock_info_global_cls(symbol="重点")
+        except Exception:
+            df = ak.stock_info_global_cls()
+    except Exception as e:
+        print(f"  [Market WARN] 财联社快讯获取失败: {e}")
+        return []
+
+    if df is None or df.empty:
+        return []
+
+    title_col = next((c for c in df.columns if "标题" in c or "title" in c.lower()), None)
+    content_col = next((c for c in df.columns if "内容" in c or "content" in c.lower()), None)
+    time_col = next((c for c in df.columns if "时间" in c or "发布" in c), None)
+    if not title_col:
+        return []
+
+    keywords = [
+        "AI", "人工智能", "大模型", "算力", "芯片", "半导体", "GPU",
+        "云", "软件", "SaaS", "数据", "鸿蒙", "操作系统", "机器人",
+        "智能驾驶", "自动驾驶", "OpenAI", "英伟达", "腾讯", "阿里",
+        "华为", "比亚迪", "字节", "百度", "中芯", "寒武纪",
+        "融资", "投资", "上市", "IPO", "并购", "回购", "增持",
+    ]
+    out = []
+    for _, row in df.iterrows():
+        title = str(row.get(title_col, "")).strip()
+        if not title:
+            continue
+        content = str(row.get(content_col, "") or "").strip() if content_col else ""
+        if not any(k in title or k in content for k in keywords):
+            continue
+        out.append({
+            "time": str(row.get(time_col, "") or "")[:16] if time_col else "",
+            "title": title,
+            "content": content[:200],
+        })
+        if len(out) >= n:
+            break
+    return out
+
+def collect_a_stock_tech_market() -> dict:
+    """A股科技板块行情一站式采集。"""
+    print("[Scraper] 采集 A股科技板块行情...")
+    sectors = fetch_tech_concept_sectors(top_n=10)
+    print(f"  → 科技板块 {len(sectors)} 个")
+
+    leaders = {}
+    for s in sectors[:5]:
+        stocks = fetch_concept_top_stocks(s["name"], n=3)
+        if stocks:
+            leaders[s["name"]] = stocks
+
+    north = fetch_north_bound_flow()
+    if north:
+        print(f"  → 北向资金净流入 {north['net_inflow_yi']:.2f} 亿")
+
+    return {
+        "sectors": sectors,
+        "leaders": leaders,
+        "north_flow": north,
+    }
+
+def collect_cls_tech_news() -> list[dict]:
+    print("[Scraper] 采集财联社科技/资本快讯...")
+    items = fetch_cls_news(n=20)
+    print(f"  → 财联社快讯 {len(items)} 条")
+    return items

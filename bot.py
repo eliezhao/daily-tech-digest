@@ -30,7 +30,13 @@ if os.path.exists(_env_path):
                 _k, _v = _line.split("=", 1)
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-from scrapers import collect_all_events, collect_all_funding
+from scrapers import (
+    collect_all_events,
+    collect_all_funding,
+    collect_a_stock_tech_market,
+    collect_cls_tech_news,
+    is_a_stock_open_today,
+)
 
 # ── 配置（全部从环境变量读取）──────────────────────────────────────────────
 def _require(key: str) -> str:
@@ -41,7 +47,9 @@ def _require(key: str) -> str:
 
 KIMI_API_KEY  = _require("KIMI_API_KEY")
 KIMI_BASE_URL = "https://api.moonshot.cn/v1"
-KIMI_MODEL    = "moonshot-v1-128k"
+# 默认使用 K2 Thinking（更强金融/工具链推理），可通过环境变量覆盖回退
+KIMI_MODEL          = os.environ.get("KIMI_MODEL", "kimi-k2-thinking")
+KIMI_FALLBACK_MODEL = os.environ.get("KIMI_FALLBACK_MODEL", "moonshot-v1-128k")
 
 TG_TOKEN   = _require("TG_TOKEN")
 TG_CHAT_ID = _require("TG_CHAT_ID")
@@ -73,17 +81,36 @@ def tg_send(text: str):
         time.sleep(0.5)
 
 # ── Kimi 联网搜索（多轮 tool_calls）────────────────────────────────────────
-def kimi_ask(prompt: str, max_rounds: int = 10) -> str:
-    tools = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+class KimiContentFilterError(Exception):
+    """Kimi 内容风控拦截，无法通过重试解决。"""
+
+def _is_content_filter_error(exc: Exception) -> bool:
+    s = str(exc)
+    return ("content_filter" in s) or ("high risk" in s) or ("considered high risk" in s)
+
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in ["model not found", "invalid_model", "model_not_found", "unsupported model", "does not exist"])
+
+def kimi_ask(prompt: str, max_rounds: int = 10, enable_search: bool = True) -> str:
+    tools = [{"type": "builtin_function", "function": {"name": "$web_search"}}] if enable_search else None
     messages = [{"role": "user", "content": prompt}]
+    model_in_use = KIMI_MODEL
     for _ in range(max_rounds):
-        resp = client.chat.completions.create(
-            model=KIMI_MODEL,
-            messages=messages,
-            tools=tools,
-            temperature=0.3,
-            max_tokens=4096,
-        )
+        try:
+            kwargs = dict(model=model_in_use, messages=messages, temperature=0.3, max_tokens=4096)
+            if tools:
+                kwargs["tools"] = tools
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if _is_content_filter_error(e):
+                print(f"  [Kimi BLOCKED] 内容被风控拦截：{str(e)[:200]}")
+                raise KimiContentFilterError(str(e)) from e
+            if _is_model_unavailable_error(e) and model_in_use != KIMI_FALLBACK_MODEL:
+                print(f"  [Kimi] 模型 {model_in_use} 不可用，回退到 {KIMI_FALLBACK_MODEL}")
+                model_in_use = KIMI_FALLBACK_MODEL
+                continue
+            raise
         choice = resp.choices[0]
         msg = choice.message
         if choice.finish_reason == "tool_calls":
@@ -179,7 +206,16 @@ def build_events_report(date: str) -> str:
 6. 如某条信息不完整，保留已有内容，不要编造"""
 
     print("  [Events] Kimi 最终汇总整理...")
-    return kimi_ask(final_prompt)
+    try:
+        return kimi_ask(final_prompt)
+    except KimiContentFilterError as e:
+        print(f"  [Events] 最终汇总被风控拦截，回退到原始数据：{str(e)[:120]}")
+        return (
+            "⚠️ AI 汇总被内容风控拦截，以下为原始抓取数据（截断展示）：\n\n"
+            f"📅 Meetup 活动：\n{meetup_text[:2000] or '（无）'}\n\n"
+            f"🔗 活动行 URL：\n{hdx_text[:1500] or '（无）'}\n\n"
+            f"🔍 联网搜索原文：\n{kimi_raw[:2500] or '（无）'}"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 任务二：投融资日报
@@ -288,7 +324,107 @@ def build_funding_report(date: str) -> str:
 7. 最多展示20条，优先展示华南地区"""
 
     print(f"  [Funding] RSS过滤后 {len(filtered_items)} 条，Kimi 最终汇总整理...")
-    return kimi_ask(final_prompt)
+    try:
+        return kimi_ask(final_prompt)
+    except KimiContentFilterError as e:
+        print(f"  [Funding] 最终汇总被风控拦截，回退到原始数据：{str(e)[:120]}")
+        return (
+            "⚠️ AI 汇总被内容风控拦截，以下为原始抓取数据（截断展示）：\n\n"
+            f"📰 TechCrunch RSS（{len(filtered_items)} 条，已按15天过滤）：\n{rss_text[:2500] or '（无）'}\n\n"
+            f"🔍 联网搜索原文：\n{kimi_raw[:2500] or '（无）'}"
+        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 任务三：A股科技股市场日报 + 财联社快讯
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_sectors(sectors: list) -> str:
+    if not sectors:
+        return "（无数据）"
+    lines = []
+    for s in sectors:
+        arrow = "📈" if s["change_pct"] >= 0 else "📉"
+        leader = f" 领涨:{s['leader']}" if s.get("leader") else ""
+        breadth = f" 涨/跌:{s['stocks_up']}/{s['stocks_down']}" if s.get("stocks_up") else ""
+        lines.append(f"{arrow} {s['name']}  {s['change_pct']:+.2f}%{leader}{breadth}")
+    return "\n".join(lines)
+
+def _fmt_leaders(leaders: dict) -> str:
+    if not leaders:
+        return "（无数据）"
+    blocks = []
+    for sector, stocks in leaders.items():
+        items = " · ".join(
+            f"{s['name']}({s['code']}) {s['change_pct']:+.2f}%" for s in stocks
+        )
+        blocks.append(f"【{sector}】{items}")
+    return "\n".join(blocks)
+
+def _fmt_news(items: list) -> str:
+    if not items:
+        return "（无数据）"
+    return "\n".join(
+        f"- [{it.get('time','')}] {it['title']}"
+        + (f"\n  {it['content']}" if it.get("content") else "")
+        for it in items
+    )
+
+def build_market_report(date: str) -> str:
+    print("  [Market] 启动 akshare 数据采集...")
+    market = collect_a_stock_tech_market()
+    cls_news = collect_cls_tech_news()
+
+    sectors_text = _fmt_sectors(market.get("sectors", []))
+    leaders_text = _fmt_leaders(market.get("leaders", {}))
+    north = market.get("north_flow")
+    north_text = (
+        f"今日北向资金净流入 {north['net_inflow_yi']:+.2f} 亿元"
+        if north else "（数据缺失）"
+    )
+    news_text = _fmt_news(cls_news)
+
+    final_prompt = f"""你是一位资深的中国 A 股科技板块策略分析师。今天是 {date}。
+
+以下是当日盘后采集到的结构化数据，请你输出一份精炼专业的「A股科技股日报」。
+
+【一、科技概念板块涨跌幅（已筛选 AI/算力/半导体/云/软件/机器人/智能驾驶 等）】
+{sectors_text}
+
+【二、热点板块领涨个股】
+{leaders_text}
+
+【三、北向资金】
+{north_text}
+
+【四、财联社 24h 科技/资本要闻】
+{news_text}
+
+---
+
+输出要求：
+1. 直接给可读日报，不要寒暄、不要重复数据列。
+2. 结构（用 emoji 小标题）：
+   📊 板块异动：列出涨幅 TOP 3 板块 + 跌幅 TOP 2 板块，配 1 句驱动逻辑
+   🚀 个股聚焦：3-5 只今日科技龙头股，简评（业务/催化/资金）
+   💰 资金面：北向资金动向 + 任何有用的资金信号
+   📰 要闻速读：从财联社快讯中提炼 5-8 条最关键的事件（AI/算力/芯片/政策/融资优先）
+   🔮 明日观察：1-3 个值得跟踪的板块或事件（基于数据推断，不编造）
+3. 数字保留 2 位小数。涨跌符号清晰（+/-）。
+4. 不要编造未在数据中出现的公司/事件。
+5. 全部用中文，总长度控制在 1500 字以内。"""
+
+    print("  [Market] Kimi 最终汇总分析...")
+    try:
+        return kimi_ask(final_prompt, enable_search=False)
+    except KimiContentFilterError as e:
+        print(f"  [Market] 最终汇总被风控拦截，回退到原始数据：{str(e)[:120]}")
+        return (
+            "⚠️ AI 汇总被内容风控拦截，以下为原始抓取数据：\n\n"
+            f"📊 板块异动：\n{sectors_text}\n\n"
+            f"🚀 领涨个股：\n{leaders_text}\n\n"
+            f"💰 资金面：{north_text}\n\n"
+            f"📰 财联社快讯：\n{news_text[:2000]}"
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 主程序
@@ -318,6 +454,24 @@ def main():
     cutoff_str = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=15)).strftime("%Y-%m-%d")
     tg_send(f"💼 *科技投融资周报*\n📅 {cutoff_str} → {date_str}（过去15天）\nAI / 软件 / 云计算 | 华南优先 ☁️🤖\n\n{funding_report}")
     print(f"[{ts()}] 投融资日报已发送")
+
+    time.sleep(3)
+
+    # ── A股科技股市场日报 ────────────────────────────────────────────────────
+    print(f"\n[{ts()}] === 任务三：A股科技股市场日报 ===")
+    try:
+        if not is_a_stock_open_today():
+            skip_msg = f"📊 *A股科技股市场日报*\n_{date_str}_\n\n今日非 A 股交易日，跳过市场日报。"
+            tg_send(skip_msg)
+            print(f"[{ts()}] 非交易日，跳过市场日报")
+        else:
+            market_report = build_market_report(date_str)
+            tg_send(f"📊 *A股科技股市场日报*\n_{date_str}_\nAI / 半导体 / 算力 / 云 / 软件 🤖☁️📈\n\n{market_report}")
+            print(f"[{ts()}] 市场日报已发送")
+    except Exception as e:
+        print(f"[{ts()}] 市场日报任务失败: {e}")
+        traceback.print_exc()
+        tg_send(f"⚠️ 市场日报任务失败：{str(e)[:300]}")
 
     print(f"\n[{ts()}] 全部完成！")
 
