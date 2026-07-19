@@ -10,3 +10,9 @@ venv/
 
 # 日志
 *.log
+
+# 本地数据缓存（板块成分股等，可随时重建）
+data/
+
+# Claude Code 本地会话目录
+.claude/

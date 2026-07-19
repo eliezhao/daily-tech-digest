@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-广深科技日报机器人 v2.0
+广深科技日报机器人 v2.1
 
 流程：
-  1. scrapers.py  — 爬虫采集 Meetup / 活动行 URL / TechCrunch RSS / 36kr
-  2. Kimi 多轮联网搜索 — 补充中文活动 & 融资信息（华南+亚洲+全球）
+  1. scrapers.py  — 爬虫采集 Meetup / 活动行 URL / TechCrunch RSS / 36kr / akshare 行情与宏观日历
+  2. Kimi 多轮联网搜索 — 补充中文活动 & 融资信息 & 中国政策（华南+亚洲+全球）
   3. 合并全部原始数据 → Kimi 最终整理去重格式化
-  4. 发送两条 Telegram 消息（活动 + 融资）
+  4. 依次发送 Telegram 消息：活动 / 投融资 / A股科技市场 / 宏观数据前瞻 / 中国政策快报*
+     * 政策快报仅在过去24小时有重磅政策时才发送
 
 密钥从环境变量读取（本地用 .env 文件，GitHub Actions 用 Secrets）
 """
@@ -15,7 +16,7 @@ import os
 import time
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 import requests
@@ -35,6 +36,8 @@ from scrapers import (
     collect_all_funding,
     collect_a_stock_tech_market,
     collect_cls_tech_news,
+    collect_cls_policy_news,
+    collect_macro_calendar,
     is_a_stock_open_today,
 )
 
@@ -47,9 +50,13 @@ def _require(key: str) -> str:
 
 KIMI_API_KEY  = _require("KIMI_API_KEY")
 KIMI_BASE_URL = "https://api.moonshot.cn/v1"
-# 默认使用 K2 Thinking（更强金融/工具链推理），可通过环境变量覆盖回退
-KIMI_MODEL          = os.environ.get("KIMI_MODEL", "kimi-k2-thinking")
-KIMI_FALLBACK_MODEL = os.environ.get("KIMI_FALLBACK_MODEL", "moonshot-v1-128k")
+# kimi-k3：当前 Kimi 通用旗舰（分析/整合最强的非 code 模型），用于纯分析/整理任务
+KIMI_MODEL          = os.environ.get("KIMI_MODEL", "kimi-k3")
+# 联网搜索任务仍用 k2.6：k3 暂不支持 $web_search builtin（回传 tool_calls 会
+# tokenization failed；改 type 则搜索结果不注入，模型只能凭记忆作答）。
+# 待 Moonshot 支持后，把 KIMI_SEARCH_MODEL 设为 kimi-k3 即可切换。
+KIMI_SEARCH_MODEL   = os.environ.get("KIMI_SEARCH_MODEL", "kimi-k2.6")
+KIMI_FALLBACK_MODEL = os.environ.get("KIMI_FALLBACK_MODEL", "kimi-k2.6")
 
 TG_TOKEN   = _require("TG_TOKEN")
 TG_CHAT_ID = _require("TG_CHAT_ID")
@@ -90,15 +97,49 @@ def _is_content_filter_error(exc: Exception) -> bool:
 
 def _is_model_unavailable_error(exc: Exception) -> bool:
     s = str(exc).lower()
-    return any(k in s for k in ["model not found", "invalid_model", "model_not_found", "unsupported model", "does not exist"])
+    return any(k in s for k in [
+        "model not found", "not found the model", "invalid_model", "model_not_found",
+        "resource_not_found", "unsupported model", "does not exist",
+    ])
+
+def _temp_for(model: str) -> float:
+    # kimi-k 系列（k2/k3）强制 temperature=1（k3 曾短暂允许低温，2026-07-19 起服务端也改为仅允许 1）；
+    # moonshot-v1 系列用低温做整理任务。下方 kimi_ask 另有 invalid temperature 自动重试兜底。
+    return 1.0 if model.startswith("kimi-k") else 0.3
+
+def _max_tokens_for(model: str) -> int:
+    # kimi-k 系列（k2/k3）是推理模型，思维链占用输出额度，长任务需给足空间，否则正文为空
+    return 16384 if model.startswith("kimi-k") else 4096
+
+def _assistant_msg_to_dict(msg) -> dict:
+    """把带 tool_calls 的 assistant 回复重建为可回传的 dict（剔除 reasoning_content 等多余字段）。
+    注意 type 必须原样保留：$web_search 回传时 type='builtin_function'，
+    改成 'function' 服务端就不再注入搜索结果，模型会凭记忆瞎答。"""
+    return {
+        "role": "assistant",
+        "content": msg.content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": tc.type,
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in (msg.tool_calls or [])
+        ],
+    }
 
 def kimi_ask(prompt: str, max_rounds: int = 10, enable_search: bool = True) -> str:
     tools = [{"type": "builtin_function", "function": {"name": "$web_search"}}] if enable_search else None
     messages = [{"role": "user", "content": prompt}]
-    model_in_use = KIMI_MODEL
+    # 搜索任务与分析任务用不同模型（k3 暂不支持 $web_search）
+    model_in_use = KIMI_SEARCH_MODEL if enable_search else KIMI_MODEL
+    temp_override = None  # Moonshot 会不定期调整温度约束，报错时自动改用 1 重试
     for _ in range(max_rounds):
         try:
-            kwargs = dict(model=model_in_use, messages=messages, temperature=0.3, max_tokens=4096)
+            kwargs = dict(model=model_in_use, messages=messages,
+                          temperature=temp_override if temp_override is not None
+                                      else _temp_for(model_in_use),
+                          max_tokens=_max_tokens_for(model_in_use))
             if tools:
                 kwargs["tools"] = tools
             resp = client.chat.completions.create(**kwargs)
@@ -106,6 +147,10 @@ def kimi_ask(prompt: str, max_rounds: int = 10, enable_search: bool = True) -> s
             if _is_content_filter_error(e):
                 print(f"  [Kimi BLOCKED] 内容被风控拦截：{str(e)[:200]}")
                 raise KimiContentFilterError(str(e)) from e
+            if "invalid temperature" in str(e).lower() and temp_override is None:
+                print(f"  [Kimi] {model_in_use} 温度约束变更，改用 temperature=1 重试")
+                temp_override = 1.0
+                continue
             if _is_model_unavailable_error(e) and model_in_use != KIMI_FALLBACK_MODEL:
                 print(f"  [Kimi] 模型 {model_in_use} 不可用，回退到 {KIMI_FALLBACK_MODEL}")
                 model_in_use = KIMI_FALLBACK_MODEL
@@ -114,7 +159,7 @@ def kimi_ask(prompt: str, max_rounds: int = 10, enable_search: bool = True) -> s
         choice = resp.choices[0]
         msg = choice.message
         if choice.finish_reason == "tool_calls":
-            messages.append(msg)
+            messages.append(_assistant_msg_to_dict(msg))
             for tc in msg.tool_calls:
                 messages.append({
                     "role": "tool",
@@ -123,7 +168,10 @@ def kimi_ask(prompt: str, max_rounds: int = 10, enable_search: bool = True) -> s
                     "content": tc.function.arguments,
                 })
         else:
-            return msg.content or ""
+            content = msg.content or ""
+            if not content.strip() and choice.finish_reason == "length":
+                print("  [Kimi WARN] 输出为空且 max_tokens 耗尽（思维链占满输出额度）")
+            return content
     return "（Kimi 搜索轮次超限）"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,7 +383,7 @@ def build_funding_report(date: str) -> str:
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 任务三：A股科技股市场日报 + 财联社快讯
+# 任务三：A股科技股市场日报 + 要闻快讯
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_sectors(sectors: list) -> str:
@@ -396,7 +444,7 @@ def build_market_report(date: str) -> str:
 【三、北向资金】
 {north_text}
 
-【四、财联社 24h 科技/资本要闻】
+【四、24h 科技/资本要闻快讯（财联社/东财）】
 {news_text}
 
 ---
@@ -407,7 +455,7 @@ def build_market_report(date: str) -> str:
    📊 板块异动：列出涨幅 TOP 3 板块 + 跌幅 TOP 2 板块，配 1 句驱动逻辑
    🚀 个股聚焦：3-5 只今日科技龙头股，简评（业务/催化/资金）
    💰 资金面：北向资金动向 + 任何有用的资金信号
-   📰 要闻速读：从财联社快讯中提炼 5-8 条最关键的事件（AI/算力/芯片/政策/融资优先）
+   📰 要闻速读：从要闻快讯中提炼 5-8 条最关键的事件（AI/算力/芯片/政策/融资优先）
    🔮 明日观察：1-3 个值得跟踪的板块或事件（基于数据推断，不编造）
 3. 数字保留 2 位小数。涨跌符号清晰（+/-）。
 4. 不要编造未在数据中出现的公司/事件。
@@ -423,8 +471,186 @@ def build_market_report(date: str) -> str:
             f"📊 板块异动：\n{sectors_text}\n\n"
             f"🚀 领涨个股：\n{leaders_text}\n\n"
             f"💰 资金面：{north_text}\n\n"
-            f"📰 财联社快讯：\n{news_text[:2000]}"
+            f"📰 要闻快讯：\n{news_text[:2000]}"
         )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 任务四：宏观数据前瞻（今日 + 本周将发布的重要经济数据）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 日报定时在北京时间 08:00 发出，但 GitHub Actions runner 时区为 UTC，
+# 所有"今天/本周/昨天"的日期计算必须显式使用北京时间。
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+def _fmt_calendar(items: list) -> str:
+    if not items:
+        return "（无条目）"
+    lines = []
+    for it in items:
+        stars = "⭐" * min(it["importance"], 5)
+        tail = "".join([
+            f" | 预期 {it['expected']}" if it["expected"] else "",
+            f" | 前值 {it['previous']}" if it["previous"] else "",
+            f" | 已公布 {it['actual']}" if it["actual"] else "",
+        ])
+        lines.append(f"- {it['time']} [{it['region']}] {it['event']} {stars}{tail}")
+    return "\n".join(lines)
+
+def build_macro_calendar_report() -> str:
+    now_bj = datetime.now(BEIJING_TZ)
+    today = now_bj.strftime("%Y-%m-%d")
+    # 窗口：今天 → 本周日；周六/周日发报时数据已出尽，扩展到下周日预览下周
+    days_to_sunday = 6 - now_bj.weekday()
+    if days_to_sunday < 2:
+        days_to_sunday += 7
+    dates = [now_bj + timedelta(days=i) for i in range(days_to_sunday + 1)]
+    start, end = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
+
+    print(f"  [Macro] 日历窗口：{start} → {end}（北京时间）")
+    items = collect_macro_calendar([d.strftime("%Y%m%d") for d in dates], start, end)
+
+    today_items = [it for it in items if it["time"][:10] == today]
+    later_items = [it for it in items if it["time"][:10] > today]
+
+    # akshare 日历失效/数据过少时，用 Kimi 联网搜索兜底
+    kimi_raw = ""
+    if len(items) < 5:
+        print("  [Macro] 日历数据不足，Kimi 联网搜索兜底...")
+        try:
+            kimi_raw = kimi_ask(
+                f"今天是{today}。请联网搜索{start}至{end}期间的全球重要经济数据发布日历，"
+                "重点：美联储FOMC利率决议/会议纪要/美联储主席及官员讲话、美国非农就业报告、"
+                "CPI、PCE、PPI、GDP、初请失业金、ISM PMI、零售销售，"
+                "以及中国的官方PMI/CPI/PPI/社融信贷/LPR/进出口数据。"
+                "每条注明发布日期、北京时间、预期值、前值。只返回原始信息列表。"
+            )
+        except Exception as e:
+            print(f"  [Macro] 兜底搜索失败: {e}")
+            kimi_raw = ""
+
+    final_prompt = f"""你是宏观策略分析师。今天是 {today}（北京时间）。以下是 {start} 至 {end} 的宏观经济日历原始数据，时间均为北京时间，⭐数量代表重要性。
+
+【今日（{today}）条目】
+{_fmt_calendar(today_items)}
+
+【后续条目（明天起至 {end}）】
+{_fmt_calendar(later_items)}
+
+【联网搜索兜底数据】
+{kimi_raw or "（未启用）"}
+
+---
+
+请输出「宏观数据前瞻与影响分析」，要求：
+
+一、筛选：只保留对股市有明显影响的条目，优先级从高到低：美联储（利率决议/会议纪要/主席及官员讲话）→ 美国非农与失业率 → 美国通胀（CPI/PCE/PPI）→ 美国 GDP/ISM/初请失业金/零售销售 → 中国宏观（PMI/CPI/PPI/社融/LPR/进出口/外储）→ 欧日等主要央行 → 重大财经事件（关税听证、重要峰会等）。剔除个股与公司层面新闻、产品涨价类条目、钻井数等低影响数据。
+
+二、对每一条重要数据做情景分析，格式：
+
+🕐 MM-DD周X HH:MM [地区] 数据名称 ⭐⭐⭐
+   前值 xx | 预期 xx（已公布的补充实际值和偏离方向）
+   ↑ 超预期：倾向利好/利空 + 一句传导逻辑（对美股/A股/美元的方向）
+   ↓ 不及预期：倾向利好/利空 + 一句传导逻辑
+（讲话/会议/事件类无前值预期，改为一行：鹰派→…；鸽派→…，或"关注点：…"）
+
+三、输出结构：
+🎯 今日关注（{today}）
+逐条情景分析；若无重要数据写「今日无重磅数据」。
+📅 本周后续
+按日期分组，逐条情景分析；若无写「后续暂无重磅数据」。
+💡 焦点
+2-3 句：本期最关键的 1-2 个数据；点明当前市场的主要交易框架（例如处于"降息预期交易"还是"衰退担忧交易"，这决定了强数据是利好还是利空）。
+
+四、分析准则：
+1. 结合数据性质判断方向：通胀类（CPI/PCE/PPI）超预期通常压制降息预期→利空股市；就业类（非农/初请）超预期→经济强但降息预期降温，方向取决于当前市场敏感点，要说清楚；PMI 类以 50 为荣枯线。
+2. 中国数据需同时给出对 A 股相关板块的影响方向。
+3. 判断用"倾向利好/利空"的谨慎表述，双向可能时明确说明，不构成投资建议。
+4. 严格基于上面提供的数据条目，不要编造。总长度控制在 2000 字以内。
+5. 输出为发往 Telegram 的纯文本：禁止使用 HTML 标签和 &nbsp; 等 HTML 实体，缩进用普通空格。"""
+
+    print("  [Macro] Kimi 最终汇总整理...")
+    try:
+        result = kimi_ask(final_prompt, enable_search=False)
+        if result.strip():
+            return result
+        print("  [Macro] 汇总返回为空，回退原始数据")
+    except KimiContentFilterError as e:
+        print(f"  [Macro] 汇总被风控拦截，回退原始数据：{str(e)[:120]}")
+    return (
+        "⚠️ AI 汇总不可用，以下为原始日历数据：\n\n"
+        f"🎯 今日：\n{_fmt_calendar(today_items)[:1500]}\n\n"
+        f"📅 后续：\n{_fmt_calendar(later_items)[:2000]}"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 任务五：中国政策快报（昨天 00:00 → 发报时刻；无重磅政策则不发送）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_china_policy_report() -> str | None:
+    """返回政策快报文本；窗口内无重磅政策时返回 None（调用方跳过发送）。"""
+    now_bj = datetime.now(BEIJING_TZ)
+    yesterday = (now_bj - timedelta(days=1)).strftime("%Y-%m-%d")
+    now_str = now_bj.strftime("%Y-%m-%d %H:%M")
+
+    cls_items = collect_cls_policy_news()
+    cls_text = _fmt_news(cls_items)
+
+    print("  [Policy] Kimi 联网搜索政策新闻...")
+    try:
+        kimi_raw = kimi_ask(
+            f"现在是北京时间 {now_str}。请联网搜索 {yesterday} 00:00 至今中国官方新发布的重磅政策，"
+            "来源限定：国务院/国常会、中共中央/中央政治局会议、中国人民银行、发改委、财政部、证监会、"
+            "工信部、商务部、金融监管总局、网信办等国家部委的正式政策文件、会议决定、监管新规、"
+            "货币政策操作（降准/降息/LPR/大额流动性投放）。"
+            "重点关注影响股市、科技产业、宏观经济的政策。每条注明发布机构、发布时间、来源链接。"
+            f"只要 {yesterday} 00:00 之后正式发布的，旧政策及其解读文章不要。"
+            "如果确实没有新发布的重磅政策，直接回答：无重磅政策。"
+        )
+    except Exception as e:
+        print(f"  [Policy] 联网搜索失败: {str(e)[:120]}")
+        kimi_raw = "（联网搜索失败，无结果）"
+
+    final_prompt = f"""现在是北京时间 {now_str}。以下是过去约24-32小时（{yesterday} 00:00 至今）采集到的中国政策相关信息。
+
+【要闻快讯（政策相关，过去约32h，财联社/东财）】
+{cls_text}
+
+【联网搜索结果】
+{kimi_raw}
+
+---
+
+判断标准——只有"重磅政策"才值得播报：国家级政策文件发布、国常会/政治局会议重要决定、央行货币政策操作（降准/降息/LPR调整/大额流动性投放）、重要行业监管新规、重大产业扶持政策，且发布时间在 {yesterday} 00:00 之后。
+
+如果没有满足标准的重磅政策，只输出这一串字符，不要输出其他任何内容：NO_POLICY
+
+如果有，则输出「中国政策快报」，要求：
+1. 每条格式：
+   🏛 政策/事件名称
+   🕐 发布时间 + 发布机构
+   📌 核心内容（2-3句）
+   📈 影响分析：利好哪些板块/资产 + 一句传导逻辑；如有受损方也点明；并给力度判断（重磅/中性/边际）。表述客观谨慎，不构成投资建议
+2. 按重要性排序，最多5条。
+3. 普通新闻、旧政策解读、专家观点、媒体评论均不算新政策，不要收录；无法确认发布时间的不要收录。
+4. 总长度控制在 1000 字以内。
+5. 输出为发往 Telegram 的纯文本：禁止使用 HTML 标签和 &nbsp; 等 HTML 实体，缩进用普通空格。"""
+
+    print("  [Policy] Kimi 最终汇总判定...")
+    try:
+        result = kimi_ask(final_prompt)
+    except KimiContentFilterError as e:
+        print(f"  [Policy] 汇总被风控拦截：{str(e)[:120]}")
+        # 无法完成重磅性判定；若快讯源有政策类条目则播报原文，否则跳过
+        if cls_items:
+            return (
+                "⚠️ AI 汇总被内容风控拦截，以下为政策相关快讯原文（未经重磅性筛选）：\n\n"
+                + cls_text[:2500]
+            )
+        return None
+
+    if not result or "NO_POLICY" in result[:100]:
+        return None
+    return result
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 主程序
@@ -434,10 +660,10 @@ def main():
     ts = lambda: datetime.now().strftime("%H:%M:%S")
 
     print(f"\n{'='*60}")
-    print(f"广深科技日报 v2.0  {date_str}")
+    print(f"广深科技日报 v2.1  {date_str}")
     print(f"{'='*60}\n")
 
-    tg_send(f"🤖 *广深科技日报 v2.0 — {date_str}*\n正在多源采集中，请稍候…")
+    tg_send(f"🤖 *广深科技日报 v2.1 — {date_str}*\n正在多源采集中，请稍候…")
 
     # ── 活动日报 ─────────────────────────────────────────────────────────────
     print(f"[{ts()}] === 任务一：线下活动 ===")
@@ -472,6 +698,35 @@ def main():
         print(f"[{ts()}] 市场日报任务失败: {e}")
         traceback.print_exc()
         tg_send(f"⚠️ 市场日报任务失败：{str(e)[:300]}")
+
+    time.sleep(3)
+
+    # ── 宏观数据前瞻 ─────────────────────────────────────────────────────────
+    print(f"\n[{ts()}] === 任务四：宏观数据前瞻 ===")
+    try:
+        macro_report = build_macro_calendar_report()
+        tg_send(f"🌍 *宏观数据前瞻*\n_{date_str}_\n美联储 / 非农 / 通胀 / 中国宏观 📊\n\n{macro_report}")
+        print(f"[{ts()}] 宏观数据前瞻已发送")
+    except Exception as e:
+        print(f"[{ts()}] 宏观前瞻任务失败: {e}")
+        traceback.print_exc()
+        tg_send(f"⚠️ 宏观数据前瞻任务失败：{str(e)[:300]}")
+
+    time.sleep(3)
+
+    # ── 中国政策快报（有重磅政策才发送）──────────────────────────────────────
+    print(f"\n[{ts()}] === 任务五：中国政策快报 ===")
+    try:
+        policy_report = build_china_policy_report()
+        if policy_report:
+            tg_send(f"🏛 *中国政策快报*\n_{date_str}_\n过去24小时新出重磅政策 🇨🇳\n\n{policy_report}")
+            print(f"[{ts()}] 政策快报已发送")
+        else:
+            print(f"[{ts()}] 过去24小时无重磅政策，跳过发送")
+    except Exception as e:
+        print(f"[{ts()}] 政策快报任务失败: {e}")
+        traceback.print_exc()
+        tg_send(f"⚠️ 中国政策快报任务失败：{str(e)[:300]}")
 
     print(f"\n[{ts()}] 全部完成！")
 

@@ -1,0 +1,28 @@
+# Telegram 指令机器人 systemd 服务
+# 安装：
+#   sudo cp deploy/tg-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tg-bot
+# 查看日志：
+#   journalctl -u tg-bot -f
+#
+# 注意：假设代码在 /opt/daily-tech-digest，.env 放在同目录。
+# 路径不同请改 WorkingDirectory / ExecStart。
+
+[Unit]
+Description=A-share sector analysis Telegram bot (long polling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/daily-tech-digest
+ExecStart=/opt/daily-tech-digest/venv/bin/python /opt/daily-tech-digest/tg_bot.py
+Restart=always
+RestartSec=10
+# .env 由 tg_bot.py 自行加载（也可改用 EnvironmentFile=/opt/daily-tech-digest/.env）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -5,6 +5,8 @@ scrapers.py — 多源数据采集模块
 Sources:
   Events  : Meetup (多城市 Apollo cache)  + 活动行 (事件 URL 列表)
   Funding : TechCrunch RSS (多 tag)       + 36kr 简单抓取
+  Market  : akshare A股板块行情 + 财联社快讯
+  Macro   : 华尔街见闻宏观日历 (akshare macro_info_ws) + 财联社政策快讯
 """
 
 import json
@@ -19,6 +21,28 @@ import requests
 from bs4 import BeautifulSoup
 
 # ── HTTP 配置 ────────────────────────────────────────────────────────────────
+# akshare 内部的 requests 调用不设超时（requests timeout=None 会永久阻塞，
+# socket.setdefaulttimeout 拦不住），必须用守护线程加墙钟超时兜底
+def _call_with_timeout(fn, timeout_s: float = 30):
+    """在守护线程中执行 fn，超时抛 TimeoutError（挂死的线程不阻塞进程退出）。"""
+    import threading
+    result = {"value": None, "exc": None}
+
+    def _runner():
+        try:
+            result["value"] = fn()
+        except Exception as e:
+            result["exc"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"调用超时（>{timeout_s}s）")
+    if result["exc"] is not None:
+        raise result["exc"]
+    return result["value"]
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -306,7 +330,7 @@ def is_a_stock_open_today() -> bool:
     """简易判断今日是否 A 股交易日。失败时默认 True（保证数据采集尝试）。"""
     try:
         import akshare as ak
-        df = ak.tool_trade_date_hist_sina()
+        df = _call_with_timeout(ak.tool_trade_date_hist_sina, 30)
         today = datetime.now().strftime("%Y-%m-%d")
         return today in df["trade_date"].astype(str).values
     except Exception as e:
@@ -317,7 +341,7 @@ def fetch_tech_concept_sectors(top_n: int = 10) -> list[dict]:
     """获取科技相关概念板块涨跌幅，按涨幅排序返回 TOP N。"""
     try:
         import akshare as ak
-        df = ak.stock_board_concept_name_em()
+        df = _call_with_timeout(ak.stock_board_concept_name_em, 30)
     except Exception as e:
         print(f"  [Market WARN] 板块数据获取失败: {e}")
         return []
@@ -351,7 +375,7 @@ def fetch_concept_top_stocks(concept: str, n: int = 3) -> list[dict]:
     """获取某概念板块涨幅前 N 个成分股。"""
     try:
         import akshare as ak
-        df = ak.stock_board_concept_cons_em(symbol=concept)
+        df = _call_with_timeout(lambda: ak.stock_board_concept_cons_em(symbol=concept), 30)
     except Exception as e:
         print(f"  [Market WARN] 板块 {concept} 成分股获取失败: {e}")
         return []
@@ -378,7 +402,7 @@ def fetch_north_bound_flow() -> Optional[dict]:
     """北向资金当日净流入（单位：亿元）。"""
     try:
         import akshare as ak
-        df = ak.stock_hsgt_fund_flow_summary_em()
+        df = _call_with_timeout(ak.stock_hsgt_fund_flow_summary_em, 30)
         if df is None or df.empty:
             return None
         # 取北上汇总行
@@ -393,47 +417,98 @@ def fetch_north_bound_flow() -> Optional[dict]:
         print(f"  [Market WARN] 北向资金获取失败: {e}")
         return None
 
-def fetch_cls_news(n: int = 20) -> list[dict]:
-    """财联社 24h 重要快讯（仅保留科技/AI/资本相关）。"""
+# 财联社快讯过滤关键词：科技/资本（市场日报用）
+CLS_TECH_KEYWORDS = [
+    "AI", "人工智能", "大模型", "算力", "芯片", "半导体", "GPU",
+    "云", "软件", "SaaS", "数据", "鸿蒙", "操作系统", "机器人",
+    "智能驾驶", "自动驾驶", "OpenAI", "英伟达", "腾讯", "阿里",
+    "华为", "比亚迪", "字节", "百度", "中芯", "寒武纪",
+    "融资", "投资", "上市", "IPO", "并购", "回购", "增持",
+]
+
+# 财联社快讯过滤关键词：政策/宏观（政策快报用）
+CLS_POLICY_KEYWORDS = [
+    "国务院", "国常会", "中共中央", "政治局", "中央财经", "五年规划",
+    "央行", "人民银行", "发改委", "财政部", "证监会", "工信部", "商务部",
+    "金融监管总局", "网信办", "国资委", "税务总局", "海关总署", "国家统计局",
+    "政策", "新规", "条例", "办法", "细则", "指导意见", "行动方案", "试点",
+    "降准", "降息", "LPR", "逆回购", "MLF", "专项债", "特别国债", "关税", "补贴",
+]
+
+BEIJING_TZ = timezone(timedelta(hours=8))  # 快讯时间戳均为北京时间
+
+_telegraph_cache: Optional[list[dict]] = None
+
+def _fetch_news_telegraph() -> list[dict]:
+    """快讯原始条目 [{time,title,content}]：财联社优先，失效时降级东方财富全球快讯。
+    结果按运行进程缓存（科技快讯与政策快讯共用同一次抓取）。"""
+    global _telegraph_cache
+    if _telegraph_cache is not None:
+        return _telegraph_cache
+    import akshare as ak
+    # 1) 财联社（2026-07 起接口 404/挂起，保留以便上游修复后自动恢复）
     try:
-        import akshare as ak
         try:
-            df = ak.stock_info_global_cls(symbol="重点")
+            df = _call_with_timeout(lambda: ak.stock_info_global_cls(symbol="重点"), 25)
         except Exception:
-            df = ak.stock_info_global_cls()
+            df = _call_with_timeout(ak.stock_info_global_cls, 25)
+        if df is not None and not df.empty:
+            title_col = next((c for c in df.columns if "标题" in c or "title" in c.lower()), None)
+            content_col = next((c for c in df.columns if "内容" in c or "content" in c.lower()), None)
+            time_col = next((c for c in df.columns if "时间" in c or "发布" in c), None)
+            if title_col:
+                _telegraph_cache = [
+                    {
+                        "time": str(r.get(time_col, "") or "") if time_col else "",
+                        "title": str(r.get(title_col, "")).strip(),
+                        "content": str(r.get(content_col, "") or "").strip() if content_col else "",
+                    }
+                    for _, r in df.iterrows()
+                ]
+                return _telegraph_cache
     except Exception as e:
-        print(f"  [Market WARN] 财联社快讯获取失败: {e}")
+        print(f"  [News WARN] 财联社快讯获取失败: {str(e)[:120]}")
+    # 2) 东方财富全球财经快讯
+    try:
+        df = _call_with_timeout(ak.stock_info_global_em, 25)
+        if df is not None and not df.empty:
+            print("  [News] 财联社不可用，改用东方财富全球快讯")
+            _telegraph_cache = [
+                {
+                    "time": str(r.get("发布时间", "") or ""),
+                    "title": str(r.get("标题", "")).strip(),
+                    "content": str(r.get("摘要", "") or "").strip(),
+                }
+                for _, r in df.iterrows()
+            ]
+            return _telegraph_cache
+    except Exception as e:
+        print(f"  [News WARN] 东方财富快讯获取失败: {str(e)[:120]}")
+    _telegraph_cache = []
+    return _telegraph_cache
+
+def fetch_cls_news(n: int = 20, keywords: Optional[list[str]] = None, hours: int = 24) -> list[dict]:
+    """近 hours 小时内重要快讯，按关键词过滤（默认科技/AI/资本相关）。"""
+    rows = _fetch_news_telegraph()
+    if not rows:
         return []
 
-    if df is None or df.empty:
-        return []
-
-    title_col = next((c for c in df.columns if "标题" in c or "title" in c.lower()), None)
-    content_col = next((c for c in df.columns if "内容" in c or "content" in c.lower()), None)
-    time_col = next((c for c in df.columns if "时间" in c or "发布" in c), None)
-    if not title_col:
-        return []
-
-    keywords = [
-        "AI", "人工智能", "大模型", "算力", "芯片", "半导体", "GPU",
-        "云", "软件", "SaaS", "数据", "鸿蒙", "操作系统", "机器人",
-        "智能驾驶", "自动驾驶", "OpenAI", "英伟达", "腾讯", "阿里",
-        "华为", "比亚迪", "字节", "百度", "中芯", "寒武纪",
-        "融资", "投资", "上市", "IPO", "并购", "回购", "增持",
-    ]
+    keywords = keywords or CLS_TECH_KEYWORDS
+    cutoff = datetime.now(BEIJING_TZ).replace(tzinfo=None) - timedelta(hours=hours)
     out = []
-    for _, row in df.iterrows():
-        title = str(row.get(title_col, "")).strip()
+    for r in rows:
+        title, content = r["title"], r["content"]
         if not title:
             continue
-        content = str(row.get(content_col, "") or "").strip() if content_col else ""
+        # 时间窗口过滤（解析失败则保留，交给下游判断）
+        try:
+            if datetime.strptime(r["time"][:19], "%Y-%m-%d %H:%M:%S") < cutoff:
+                continue
+        except Exception:
+            pass
         if not any(k in title or k in content for k in keywords):
             continue
-        out.append({
-            "time": str(row.get(time_col, "") or "")[:16] if time_col else "",
-            "title": title,
-            "content": content[:200],
-        })
+        out.append({"time": r["time"][:16], "title": title, "content": content[:200]})
         if len(out) >= n:
             break
     return out
@@ -461,7 +536,88 @@ def collect_a_stock_tech_market() -> dict:
     }
 
 def collect_cls_tech_news() -> list[dict]:
-    print("[Scraper] 采集财联社科技/资本快讯...")
+    print("[Scraper] 采集科技/资本快讯...")
     items = fetch_cls_news(n=20)
-    print(f"  → 财联社快讯 {len(items)} 条")
+    print(f"  → 科技/资本快讯 {len(items)} 条")
     return items
+
+def collect_cls_policy_news() -> list[dict]:
+    """快讯中的政策/宏观相关条目（政策快报数据源之一）。
+    窗口 32h ≈ 昨天 00:00 → 今早 08:00 发报时刻。"""
+    print("[Scraper] 采集政策相关快讯...")
+    items = fetch_cls_news(n=15, keywords=CLS_POLICY_KEYWORDS, hours=32)
+    print(f"  → 政策相关快讯 {len(items)} 条")
+    return items
+
+# ════════════════════════════════════════════════════════════════════════════
+# 宏观经济数据日历（华尔街见闻，时间为北京时间）
+# ════════════════════════════════════════════════════════════════════════════
+
+# 重要性 >=3 的条目全部保留；重要性 ==2 的仅保留下列关键地区（美联储/中国优先）
+MACRO_KEY_REGIONS = {"美国", "中国", "欧元区"}
+
+def collect_macro_calendar(date_list: list[str], start: str, end: str) -> list[dict]:
+    """
+    拉取华尔街见闻宏观日历（akshare macro_info_ws）。
+    date_list: YYYYMMDD 查询日期列表；start/end: YYYY-MM-DD，
+    用于过滤接口溢出返回的窗口外条目。
+    """
+    print("[Scraper] 采集宏观经济日历...")
+    try:
+        import akshare as ak
+    except Exception as e:
+        print(f"  [Macro WARN] akshare 不可用: {e}")
+        return []
+
+    out, seen = [], set()
+    for d in date_list:
+        try:
+            df = _call_with_timeout(lambda: ak.macro_info_ws(date=d), 30)
+        except Exception as e:
+            print(f"  [Macro WARN] {d} 日历获取失败: {str(e)[:120]}")
+            continue
+        if df is None or df.empty:
+            continue
+        for _, row in df.iterrows():
+            try:
+                imp = int(float(row.get("重要性", 0) or 0))
+            except Exception:
+                imp = 0
+            region = str(row.get("地区", "") or "").strip()
+            if imp < 2:
+                continue
+            if imp == 2 and region not in MACRO_KEY_REGIONS:
+                continue
+            t = str(row.get("时间", "") or "")[:16]  # YYYY-MM-DD HH:MM
+            if not (start <= t[:10] <= end):
+                continue
+            event = str(row.get("事件", "") or "").strip()
+            if not event:
+                continue
+            key = (t, event)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            def _val(v) -> str:
+                s = str(v).strip()
+                return "" if s.lower() in ("nan", "none", "nat", "") else s
+
+            out.append({
+                "time": t,
+                "region": region,
+                "event": event,
+                "importance": imp,
+                "expected": _val(row.get("预期")),
+                "previous": _val(row.get("前值")),
+                "actual": _val(row.get("今值")),
+            })
+        time.sleep(0.3)
+
+    # 条目过多时优先保留高重要性，再统一按时间排序
+    if len(out) > 120:
+        out.sort(key=lambda x: -x["importance"])
+        out = out[:120]
+    out.sort(key=lambda x: x["time"])
+    print(f"  → 宏观日历条目 {len(out)} 条（{start} ~ {end}）")
+    return out
